@@ -156,7 +156,7 @@ int main (int argc, char const *argv[]) {
 					printf("process[%d] has completed\n", pidlist[i]);
 			}
 		}
-		else {
+		else if(ins_cnt < 0) {
 			Wptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
 			for (i = 0; i < abs_cnt; ++i) 
 				Wptr->pidlist[i] = pidlist[i];
@@ -185,7 +185,7 @@ void init_Shell() {
         kill (- shell_pgid, SIGTTIN);
 
       /* Ignore interactive and job-control signals.  */
-      signal (SIGINT, SIG_IGN);
+      // signal (SIGINT, SIG_IGN);
       signal (SIGQUIT, SIG_IGN);
       signal (SIGTSTP, SIG_IGN);
       signal (SIGTTIN, SIG_IGN);
@@ -220,7 +220,7 @@ int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]) {
 	delim2 = "\t ";								//maybe not right.
 
 	gethostname(hostname,sizeof(hostname));
-	printf("[%s]$ ", hostname);
+	printf("\n[%s]$ ", hostname);
 	fgets(cmmd_input, sizeof(cmmd_input), stdin);
 	str1 = cmmd_input;
 	i = 0;
@@ -296,7 +296,7 @@ int deleteQ (Ptr2Que Wheader, int jobid) {
 	for (i = 1; i < jobid; ++i) {
 		Wptr_f = Wptr_f->next;
 		Wptr_l = Wptr_f->next;
-		if (Wptr_l == NULL)
+		if (Wptr_l == NULL)./
 			return 1;										//the target job doesn't exist
 	}
 
@@ -394,7 +394,13 @@ Ptr2Que execute_ntrcmmd(char (*syscmmd)[SEPINS][ARGLEN], Ptr2Que Wheader, Ptr2Qu
 			}
 
 			for (i = Sptr->stpid; i < Sptr->pcnt; ++i) {
-				waitpid(Sptr->pidlist[0], &status, WUNTRACED);
+				while (i == Sptr->stpid) {
+					kill(Sptr->pidlist[Sptr->stpid], SIGCONT);
+					waitpid(Sptr->pidlist[Sptr->stpid], &status, WCONTINUED);
+					if(WIFCONTINUED(status))
+						break;
+				}				
+				waitpid(Sptr->pidlist[i], &status, WUNTRACED);
 				if(WIFSTOPPED(status) == true) {
 					is_stopped = 0;
 					Sptr->stpid = i;
@@ -416,7 +422,7 @@ Ptr2Que execute_ntrcmmd(char (*syscmmd)[SEPINS][ARGLEN], Ptr2Que Wheader, Ptr2Qu
 			}
 
 			for (i = Wptr->stpid; i < Wptr->pcnt; ++i) {
-				waitpid(Wptr->pidlist[0], &status, WUNTRACED);
+				waitpid(Wptr->pidlist[i], &status, WUNTRACED);
 				if(WIFSTOPPED(status) == true) {
 					Nptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
 					for (j = 0; j < Wptr->pcnt; ++j) 
@@ -457,7 +463,12 @@ Ptr2Que execute_ntrcmmd(char (*syscmmd)[SEPINS][ARGLEN], Ptr2Que Wheader, Ptr2Qu
 		*chnptr = 1;
 		deleteQ(Sheader,jobid);
 
-		kill(Nptr->pidlist[Nptr->stpid], SIGCONT);
+		while (1) {
+			kill(Nptr->pidlist[Nptr->stpid], SIGCONT);
+			waitpid(Nptr->pidlist[Nptr->stpid], &status, WCONTINUED);
+			if(WIFCONTINUED(status))
+				break;
+		}
 	}
 	else {
 		*chnptr = 0;
