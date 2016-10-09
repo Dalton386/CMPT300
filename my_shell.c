@@ -7,104 +7,134 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <termios.h>
+#include <pwd.h>
 
-#define TOTINS 8
-#define SEPINS 16
-#define ARGLEN 32
+#define INTCNT 5							//support 5 internal commands
+#define TOTINS 8							//support at most 8 pipe commands 
+#define SEPINS 16							//each command can contain 15 arguments
+#define ARGLEN 32							//each argument can contain 31 letters
+#define TERMIN STDIN_FILENO					//the terminal used by this shell is stdin
 
-typedef struct WaitingQueue* Ptr2Que;
-struct WaitingQueue {
-	int pidlist[TOTINS];
-	int pcnt;
-	int stpid;
-	Ptr2Que next;
+typedef struct JobQ* Ptr2Job;				//the job record structure
+struct JobQ {
+	pid_t pgid;								//the pgid of relative process group
+	int status;
+	int is_completed;						//0-Not, 1-exit or terminated
+	int is_stopped;							//0-Not, 1-stopped
+	int is_legal;							//0-legal, 1-illegal
+	int is_back;							//0-not background, 1-background
+	char *cmmd;								//the string of command
+	int pidlist[TOTINS];					//track the child process of this job
+	int pstatus[TOTINS];					//track the status of each child process 
+	int pissorc[TOTINS];					//00-No; 01-stop; 10-exit or terminated
+	Ptr2Job next;
 };
 
-struct termios shell_tmodes;
+pid_t shell_pgid;
+Ptr2Job Jheader;
 
-Ptr2Que insertQ(Ptr2Que Wheader, Ptr2Que Wrear, Ptr2Que Wptr);
-Ptr2Que searchQ (Ptr2Que Wheader, int jobid);
-int initialQ(Ptr2Que Wheader);
-int deleteQ(Ptr2Que Wheader, int jobid);
+int insertQ(Ptr2Job Jheader, Ptr2Job Jptr);
+Ptr2Job searchQ (Ptr2Job Jheader, int jobid);
+int initialQ(Ptr2Job Jheader);
 int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]);
-Ptr2Que execute_ntrcmmd(char (*syscmmd)[SEPINS][ARGLEN], Ptr2Que Wheader, Ptr2Que Wrear, Ptr2Que Sheader, Ptr2Que Srear, int *chnptr);
+int count_bytes(char (*syscmmd)[SEPINS][ARGLEN]);
 int xStr2Num(char s[]);
+void append_cmmd(Ptr2Job Jptr, char (*syscmmd)[SEPINS][ARGLEN], char cmmd[]);
 void initial_syscmmd(char (*syscmmd)[SEPINS][ARGLEN]);
-void execute_process(char (*separate_syscmmd)[ARGLEN]);
+void execute_process(char (*separate_syscmmd)[ARGLEN], Ptr2Job Jptr);
 void init_Shell();
-void perror(const char *s);
-// int execute_pipes();
-
+int exe_bg(char (*syscmmd)[ARGLEN], Ptr2Job Jptr);
+int exe_fg(char (*syscmmd)[ARGLEN], Ptr2Job Jptr);
+int exe_jobs(Ptr2Job Jheader);
+int wait_job(Ptr2Job Jptr);
+int wait_process(pid_t pid, int status);
+int change_status();
 
 int main (int argc, char const *argv[]) {
-	pid_t pid;
-	char ntrcmmd[3][ARGLEN] = {"ls", "exit", "jobs"};
+	pid_t pid, pgid;
+	pid_t pidlist[TOTINS];
+	char ntrcmmd[INTCNT][ARGLEN] = {"exit", "cd", "jobs", "fg", "bg"};
 	char syscmmd[TOTINS][SEPINS][ARGLEN];
-	int ins_cnt, abs_cnt, pipe_cnt;
+	char *cmmd;
+	int ins_cnt, abs_cnt, pipe_cnt, bytes_cnt;
 	int pfd[2*(TOTINS-1)];
-	int pidlist[TOTINS];
-	int i, j, status, chnptr;
-	Ptr2Que Wheader, Wrear, Wptr;
-	Ptr2Que Sheader, Srear, Sptr;
-	Ptr2Que Nptr;
+	int i, j, k;
+	int status, intrnum;
 	const char *errs; 
-	char readbuffer[1], inputBuffer[1];
+	Ptr2Job Jptr;
 
-	Wptr = Sptr = NULL;
-	Wheader = Wrear = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
-	Sheader = Srear = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
-	initialQ(Wheader);
-	initialQ(Sheader);
-
+	//initial the job queue and shell execution environment
+	Jheader = (Ptr2Job)malloc(sizeof(struct JobQ));
+	Jptr = NULL;
+	initialQ(Jheader);
 	init_Shell();
-	while (1) {	
-		chnptr = 0;
 
+	while(1) {
+		//initial the space to store command and pid
+		//calculate the command number and bytes space needed
 		memset(pidlist,0,sizeof(pidlist));
 		initial_syscmmd(syscmmd);
 		ins_cnt = parse_shell(syscmmd);
+		bytes_cnt = count_bytes(syscmmd);
 		abs_cnt = (ins_cnt > 0) ? ins_cnt : -ins_cnt;
 		pipe_cnt = abs_cnt - 1;
+		intrnum = -1;
 
-		printf("**ins is %d, abs is %d\n", ins_cnt, abs_cnt);
-		for (i = 0; i < abs_cnt; ++i)
-			for (j = 1; j <= syscmmd[i][0][0]; j++)
-				printf("**%dth is %s\n", i, syscmmd[i][j]);
-		printf("---------------------\n");
-
-		Nptr = execute_ntrcmmd(syscmmd,Wheader,Wrear,Sheader,Srear,&chnptr);
-																	//cmmd is internal and has been executed successfully
-		if (chnptr == 1) {
-			Wrear = Nptr;
-			continue;
-		}									
-		else if (chnptr == 2) {
-			Srear = Nptr;
+		if(bytes_cnt == 0) {
+			printf("Too few arguments\n");
 			continue;
 		}
-		else if (chnptr == -1) {
+		//the command has too many arguments
+		if(abs_cnt == 0) {
+			printf("Too many or too long arguments\n");
 			continue;
-		}									
-
+		}
+		//process internal cmmd or not
+		for (i = 0; i < INTCNT; ++i) {
+			if (strcmp(syscmmd[0][1], ntrcmmd[i]) == 0) {
+				intrnum = i;
+				break;
+			}
+		}
+		switch(intrnum) {
+			case 0: exit(0);continue;
+			case 1: chdir(syscmmd[0][2]);continue;
+			case 2: exe_jobs(Jheader);continue;
+			case 3: exe_fg(syscmmd[0],Jheader);continue;
+			case 4: exe_bg(syscmmd[0],Jheader);continue;
+			default: break;
+		}
+		//create new job record to track this job
+		Jptr = (Ptr2Job)malloc(sizeof(struct JobQ));
+		initialQ(Jptr);
+		cmmd = (char *)malloc(bytes_cnt*sizeof(char));
+		memset(cmmd,0,sizeof(cmmd));
+		append_cmmd(Jptr,syscmmd,cmmd);
+		insertQ(Jheader,Jptr);
+		//fork child process and initial pipes
 		for (i = 0; i < pipe_cnt; ++i)
 			pipe(pfd+2*i);	
-
 		for (i = 0; i < abs_cnt; ++i)
 		{
 			pid = fork();
-			pidlist[i] = pid;
 			if (pid < 0) {
 				fprintf(stderr, "Fork Failed");
 				return 1;
 			}
 			else if (pid == 0) {
+				//set process group
+				pid = getpid();
+				if(Jptr->pgid == 0)
+					Jptr->pgid = pid;
+				setpgid(pid, Jptr->pgid);
+				//set signal
 				signal (SIGINT, SIG_DFL);
 			    signal (SIGQUIT, SIG_DFL);
 			    signal (SIGTSTP, SIG_DFL);
 			    signal (SIGTTIN, SIG_DFL);
 			    signal (SIGTTOU, SIG_DFL);
 			    signal (SIGCHLD, SIG_DFL);
+			    //set pipes
 				if (i == 0 && i != abs_cnt-1) {
 					close(STDOUT_FILENO);
 					dup2(pfd[1], STDOUT_FILENO);
@@ -131,81 +161,300 @@ int main (int argc, char const *argv[]) {
 						close(pfd[2*j + 1]);
 					}
 				}
-				execute_process(syscmmd[i]);
+				execute_process(syscmmd[i],Jptr);
 			}
-
+			else if (pid > 0) {
+				pidlist[i] = pid;
+				if(Jptr->pgid == 0)
+					Jptr->pgid = pid;
+				setpgid(pid, Jptr->pgid);
+			}
 		}
+		//parent close the pipes
 		for (i = 0; i < pipe_cnt; ++i) {
 			close(pfd[2*i]);
 			close(pfd[2*i + 1]);
 		}
+		//forground process
 		if (ins_cnt > 0){
-			for (i = 0; i < abs_cnt; ++i) {
-				waitpid(pidlist[i], &status, WUNTRACED);
-				if(WIFSTOPPED(status) == true) {
-					Sptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
-					for (j = 0; j < abs_cnt; ++j) 
-						Sptr->pidlist[j] = pidlist[j];
-					Sptr->pcnt = abs_cnt;
-					Sptr->stpid = i;
-					Srear = insertQ(Sheader,Srear,Sptr);
-					printf("process[%d] has been stopped\n", pidlist[i] );
-					break;
-				}
-				else
-					printf("process[%d] has completed\n", pidlist[i]);
-			}
-		}
-		else if(ins_cnt < 0) {
-			Wptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
 			for (i = 0; i < abs_cnt; ++i) 
-				Wptr->pidlist[i] = pidlist[i];
-			Wptr->pcnt = abs_cnt;
-			Wptr->stpid = 0;
-			Wrear = insertQ(Wheader,Wrear,Wptr);
-			// perror(errs);
-			printf("Let's continue!\n");
+				Jptr->pidlist[i] = pidlist[i];
+			exe_fg(NULL,Jptr);
+		}
+		//background process
+		else if(ins_cnt < 0) {
+			for (i = 0; i < abs_cnt; ++i)
+				Jptr->pidlist[i] = pidlist[i];
+			exe_bg(NULL,Jptr);
 		}
 	}
+	
+	return 0;
+}
+
+int count_bytes(char (*syscmmd)[SEPINS][ARGLEN]){
+	int i, j;
+	int bytes_cnt;
+	//count the needed bytes space for JQ to store
+	bytes_cnt = 0;
+	for (i = 0; i < TOTINS; ++i) {
+		for(j = 1; j < SEPINS; ++j) {
+			if (strlen(syscmmd[i][j]) != 0) {
+				if (i != 0 )
+					bytes_cnt += 2;
+				bytes_cnt += strlen(syscmmd[i][j]) + 1;
+			}
+			else
+				break;
+		}
+		if (j == 1)
+			break;
+	}
+
+	return bytes_cnt;
+}
+
+void append_cmmd(Ptr2Job Jptr, char (*syscmmd)[SEPINS][ARGLEN], char cmmd[]){
+	int i, j;
+	//append the command string to the JQ record
+	for (i = 0; i < TOTINS; ++i) {
+		for(j = 1; j < SEPINS; ++j) {
+			if (strlen(syscmmd[i][j]) != 0){
+				if (i != 0 )
+					strcat(cmmd,"| ");
+				strcat(cmmd,syscmmd[i][j]);
+				strcat(cmmd," ");
+			}
+			else
+				break;
+		}
+		if(j == 1)
+			break;
+	}
+
+	Jptr->cmmd = cmmd;
+}
+
+int exe_fg(char (*syscmmd)[ARGLEN], Ptr2Job Jptr){
+	int jobid = 0;
+	int i;
+	//execute the forground process
+	//find the relative JQ record
+	if (syscmmd != NULL) {
+		jobid = xStr2Num(syscmmd[2]);
+		if (jobid == 0) 
+			jobid = 1;
+		Jptr = searchQ(Jptr,jobid);
+	}
+	if (Jptr == NULL)
+		return -1;
+	//if it exists, than give it terminal control
+	tcsetpgrp (TERMIN, Jptr->pgid);
+	Jptr->is_back = 0;
+	if (Jptr->is_stopped)
+		if (kill (- Jptr->pgid, SIGCONT) < 0) {
+			perror("SIGCONT ERROR");
+			return -1;
+		}
+		else {
+			Jptr->is_stopped = 0;
+			for (i = 0; Jptr->pidlist[i] != 0; ++i)
+				Jptr->pissorc[i] &= 2;
+		}
+	//wait the job until it suspended or exited (terminated)
+	wait_job (Jptr);
+	//when the job stop running, let shell control terminal again
+	tcsetpgrp (TERMIN, shell_pgid);
+	return 0;
+}
+
+int exe_bg(char (*syscmmd)[ARGLEN], Ptr2Job Jptr){
+	int jobid = 0;
+	int i;
+	//execute job in background
+	//find the relative JQ record
+	if (syscmmd != NULL) {
+		jobid = xStr2Num(syscmmd[2]);
+		if (jobid == 0) 
+			jobid = 1;
+		Jptr = searchQ(Jptr,jobid);
+	}
+	if (Jptr == NULL)
+		return -1;
+	//if the job has been stopped, then give it continue signal
+	//and update the job status
+	if (Jptr->is_stopped)
+		if (kill (- Jptr->pgid, SIGCONT) < 0) {
+			perror("SIGCONT ERROR");
+			return -1;
+		}
+		else {
+			Jptr->is_stopped = 0;
+			for (i = 0; Jptr->pidlist[i] != 0; ++i)
+				Jptr->pissorc[i] &= 2;
+		}
+
+	Jptr->is_back = 1;
+
+	return 0;
+}
+
+int exe_jobs(Ptr2Job Jheader) {
+	int i;
+	Ptr2Job Jptr;
+	//execute "jobs" command
+	//update all jobs' status and print the job information
+	i = 1;
+	change_status();
+	for (Jptr = Jheader->next; Jptr != NULL; Jptr = Jptr->next) {
+		if (Jptr->is_completed != 1) {
+			if (Jptr->is_stopped == 1)
+				printf("[%d] Stopped         %s\n", i, Jptr->cmmd);
+			else
+				printf("[%d] Running         %s\n", i, Jptr->cmmd);
+			i++;
+		}
+	}
+
+	return 0;
+}
+
+int wait_job(Ptr2Job Jptr) {
+	int status;
+	pid_t pid;
+	//wait until certain job finished or suspended
+	//update all running jobs' status in the meanwhile
+	do {
+		pid = waitpid (WAIT_ANY, &status, WUNTRACED);
+	}
+	while (wait_process(pid,status) == 0 && Jptr->is_stopped != 1 && Jptr->is_completed != 1);
+
+	return 0;
+}
+
+int wait_process(pid_t pid, int status){
+	Ptr2Job Jptr;
+	int i;
+	//update certain process and relative job's status
+	//print job information if necessary
+	if (pid > 0){
+		for (Jptr = Jheader->next; Jptr != NULL; Jptr = Jptr->next) {
+			for (i = 0; Jptr->pidlist[i] != 0; ++i) {
+				if (Jptr->pidlist[i] == pid) {
+					Jptr->pstatus[i] = status;
+					if (WIFSTOPPED(status)) {
+						Jptr->pissorc[i] |= 1;
+						Jptr->is_stopped = 1;
+					}
+					else {
+						Jptr->pissorc[i] |= 2;
+						if (WIFSIGNALED(status)) {
+							Jptr->is_completed = 1;
+							printf("[0] Terminated      %s\n", Jptr->cmmd);
+						}
+						else if (i+1 >= TOTINS || Jptr->pidlist[i+1] == 0) {
+							Jptr->is_completed = 1;
+							if(Jptr->is_legal == 0 && Jptr->is_back == 1)
+								printf("[0] Done            %s\n",Jptr->cmmd);
+						}
+					}
+					return 0;
+				}
+			}
+		}
+
+		printf("No such process [%d]\n", pid);
+		return -1;
+	}
+	else {
+		return -1;
+	}
+}
+
+int change_status() {
+	pid_t pid;
+	int status;
+	//update all jobs' status without waiting until certain job finished
+	do {
+		pid = waitpid(WAIT_ANY, &status, WNOHANG|WUNTRACED);
+	}
+	while (wait_process(pid,status) == 0);
+
+	return 0;
+}
+
+int insertQ(Ptr2Job Jheader, Ptr2Job Jptr){
+	Ptr2Job Jrear;
+	//insert new job record into JQ
+	for (Jrear = Jheader; Jrear->next != NULL; Jrear = Jrear->next)
+		;
+	Jrear->next = Jptr;
+
+	return 0;
+}
+
+Ptr2Job searchQ (Ptr2Job Jheader, int jobid){
+	Ptr2Job Jptr;
+	int i = 0;
+	//find the jobid-th uncompleted job in the JQ
+	for (Jptr = Jheader->next; Jptr != NULL; Jptr = Jptr->next){
+		if (Jptr->is_completed != 1)
+			i++;
+		if (i == jobid)
+			return Jptr;
+	}
+
+	printf("No such job\n");
+	return NULL;
+}
+
+int initialQ(Ptr2Job Jptr){
+	//initial the JQ record
+	Jptr->pgid = 0;
+	Jptr->status = 0;
+	Jptr->is_stopped = 0;
+	Jptr->is_completed = 0;
+	Jptr->is_legal = 0;
+	Jptr->is_back = 0;
+	Jptr->cmmd = NULL;
+	memset(Jptr->pidlist,0,sizeof(Jptr->pidlist));
+	memset(Jptr->pstatus,0,sizeof(Jptr->pstatus));
+	memset(Jptr->pissorc,0,sizeof(Jptr->pissorc));
+	Jptr->next = NULL;
+
 	return 0;
 }
 
 void init_Shell() {
-	int shell_terminal;
-	int shell_is_interactive;
-	pid_t shell_pgid;
+  	//initial the shell's execution environment
+  	//this part is nearly from the GNU C Library 
+  	//without some unnecessary error detection
 
-	shell_terminal = STDIN_FILENO;
-  	shell_is_interactive = isatty (shell_terminal);
+  	while (tcgetpgrp (TERMIN) != (shell_pgid = getpgrp ()))
+    	kill (-shell_pgid, SIGTTIN);
 
-  	if (shell_is_interactive)
-    {
-      /* Loop until we are in the foreground.  */
-      while (tcgetpgrp (shell_terminal) != (shell_pgid = getpgrp ()))
-        kill (- shell_pgid, SIGTTIN);
+  	signal (SIGINT, SIG_IGN);
+  	signal (SIGQUIT, SIG_IGN);
+  	signal (SIGTSTP, SIG_IGN);
+  	signal (SIGTTIN, SIG_IGN);
+  	signal (SIGTTOU, SIG_IGN);
 
-      /* Ignore interactive and job-control signals.  */
-      // signal (SIGINT, SIG_IGN);
-      signal (SIGQUIT, SIG_IGN);
-      signal (SIGTSTP, SIG_IGN);
-      signal (SIGTTIN, SIG_IGN);
-      signal (SIGTTOU, SIG_IGN);
-      signal (SIGCHLD, SIG_IGN);
+  	shell_pgid = getpid ();
+  	setpgid (shell_pgid, shell_pgid);
+  	tcsetpgrp (TERMIN, shell_pgid);
+}
 
-      /* Put ourselves in our own process group.  */
-      shell_pgid = getpid ();
-      if (setpgid (shell_pgid, shell_pgid) < 0)
-        {
-          perror ("Couldn't put the shell in its own process group");
-          exit (1);
-        }
+int xStr2Num(char s[]) {
+	int i;
+	int number;
+	//translate a digit-string into relative number
+	number = 0;
+	for (i = 0; i < strlen(s); ++i) {
+			number *= 10;
+			number += s[i] - 48;
+	}
 
-      /* Grab control of the terminal.  */
-      tcsetpgrp (shell_terminal, shell_pgid);
-
-      /* Save default terminal attributes for shell.  */
-      tcgetattr (shell_terminal, &shell_tmodes);
-    }
+	return number;
 }
 
 int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]) {
@@ -215,16 +464,24 @@ int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]) {
 	char *delim1, *delim2;
 	int i,j;
 	char hostname[80];
-
-	delim1 = "|\n\r\f\v";
-	delim2 = "\t ";								//maybe not right.
-
+	char username[80];
+	char diretory[80];
+	//get the input from user and return both
+	//command string and the number of separate commands
+	delim1 = "|\n";
+	delim2 = "\t ";								
+	//get the configuration and print prompt
 	gethostname(hostname,sizeof(hostname));
-	printf("\n[%s]$ ", hostname);
+	getlogin_r(username,sizeof(username));
+	getcwd(diretory,sizeof(diretory));
+	printf("%s@%s:%s$ ", username, hostname, diretory);
 	fgets(cmmd_input, sizeof(cmmd_input), stdin);
 	str1 = cmmd_input;
 	i = 0;
-
+	//syscmmd[i] means each separate command
+	//syscmmd[i][j] means each argument
+	//syscmmd[i][0][0] store the argument count of each 
+	//separate command
 	for (;;str1 = NULL) {
 		j = 0;
 		token = strtok_r(str1,delim1,&saveptr1);
@@ -237,15 +494,17 @@ int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]) {
 			subtoken = strtok_r(str2,delim2,&saveptr2);
 			if (!subtoken)
 				break;
+			if(j >= SEPINS || strlen(subtoken) >= ARGLEN)
+				return 0;
 			strcpy (syscmmd[i][j], subtoken);
 		}
-		syscmmd[i][0][0] = j-1;						// the number of each sub commands, when piped, the first argument is missed, you can add it when set argv for execvp
+		syscmmd[i][0][0] = j-1;						
 		i++;
 	}
-
+	if (i > TOTINS)
+		return 0;
 	j = syscmmd[i-1][0][0];
-	if (strcmp(syscmmd[i-1][j], "&") == 0)
-	{
+	if (strcmp(syscmmd[i-1][j], "&") == 0) {
 		syscmmd[i-1][0][0] = j - 1;
 		i = -i;
 	}
@@ -253,227 +512,30 @@ int parse_shell(char (*syscmmd)[SEPINS][ARGLEN]) {
 	return i;
 }
 
-void initial_syscmmd(char (*syscmmd)[SEPINS][ARGLEN]) {
-	int i, j;
-
-	for (i = 0; i < TOTINS; ++i)
-		for (j = 0; j < SEPINS; ++j)
-			memset(syscmmd[i][j], 0, sizeof(syscmmd[i][j]));
-}
-
-void execute_process(char (*separate_syscmmd)[ARGLEN]) {
+void execute_process(char (*separate_syscmmd)[ARGLEN], Ptr2Job Jptr) {
 	char *arg[SEPINS];
 	int j;
-
+	//execute the external command
+	//if the command is illegal, then update the 
+	//relative record in JQ and print error information
 	for (j = 1; j <= separate_syscmmd[0][0]; ++j) 
 		arg[j-1] = separate_syscmmd[j];		
 
 	arg[j-1] = NULL;
-	execvp(separate_syscmmd[1],arg);
+	if (Jptr->is_legal == 1 || Jptr->is_completed == 1)
+		exit(1);
+	if(execvp(separate_syscmmd[1],arg)) {
+		perror("Illegal command");
+		Jptr->is_legal = 1;
+		Jptr->is_completed = 1;
+		exit(1);
+	}
 }
 
-int initialQ(Ptr2Que Wheader) {
-	memset(Wheader->pidlist,0,sizeof(Wheader->pidlist));
-	Wheader->next = NULL;
-	Wheader->pcnt = 0;
-	Wheader->stpid = 0;
-
-	return 0;
-}
-
-int deleteQ (Ptr2Que Wheader, int jobid) {
-	Ptr2Que Wptr_f, Wptr_l, Wptr_n;
-	int i;
-
-	if (Wheader->next == NULL)
-		return 0;
-
-	Wptr_f = Wheader;										//the first job 
-	Wptr_l = Wptr_f->next;
-	if (Wptr_l == NULL)
-		return 1;
-
-	for (i = 1; i < jobid; ++i) {
-		Wptr_f = Wptr_f->next;
-		Wptr_l = Wptr_f->next;
-		if (Wptr_l == NULL)./
-			return 1;										//the target job doesn't exist
-	}
-
-	Wptr_n = Wptr_l->next;
-	Wptr_f->next = Wptr_n;
-	Wheader->pcnt--;
-
-	free(Wptr_l);
-
-	return 0;
-}
-
-Ptr2Que insertQ(Ptr2Que Wheader, Ptr2Que Wrear, Ptr2Que Wptr) {
-	Wptr->next = NULL;
-	Wrear->next = Wptr;
-	Wrear = Wptr;
-	Wheader->pcnt++;
-
-	return Wrear;
-}
-
-Ptr2Que searchQ (Ptr2Que Wheader, int jobid) {
-	Ptr2Que Wptr;
-	int i;
-
-	if (Wheader->next == NULL)
-		return NULL;
-
-	Wptr = Wheader;
-	for (i = 0; i < jobid; ++i) {
-		Wptr = Wptr->next;
-		if (Wptr == NULL)
-			return NULL;									//the target job doesn't exist
-	}
-
-	return Wptr;	
-}
-
-int xStr2Num(char s[]) {
-	int i;
-	int number;
-
-	number = 0;
-	for (i = 0; i < strlen(s); ++i) {
-			number *= 10;
-			number += s[i] - 48;
-	}
-
-	return number;
-}
-
-Ptr2Que execute_ntrcmmd(char (*syscmmd)[SEPINS][ARGLEN], Ptr2Que Wheader, Ptr2Que Wrear, Ptr2Que Sheader, Ptr2Que Srear, int *chnptr) {
-	int i,j;
-	int jobid, status, is_stopped;
-	Ptr2Que Sptr, Wptr, Nptr, Nrear;
-
-	Sptr = Sheader;
-	Wptr = Wheader;
-	Nptr = Nrear = NULL;
-	is_stopped = 1;
-	*chnptr = -1;
-	if(strcmp(syscmmd[0][1], "exit") == 0) {					// exit
-		exit(0);
-	}
-	else if(strcmp(syscmmd[0][1], "jobs") == 0) {				//jobs
-		for(i = 1; ; ++i) {
-			if (Sptr->next == NULL)
-				break;
-			Sptr = Sptr->next;
-			printf("[%d] Stopped     1st process is %d\n", i, Sptr->pidlist[0]);
-		}
-		for(i = 1; ; ++i) {
-			if (Wptr->next == NULL)
-				break;
-			Wptr = Wptr->next;
-			printf("[%d]             1st process is %d\n", i+Sheader->pcnt, Wptr->pidlist[0]);
-		}
-
-	}
-	else if(strcmp(syscmmd[0][1], "cd") == 0) {					//cd
-		chdir(syscmmd[0][2]);
-
-	}
-	else if(strcmp(syscmmd[0][1], "fg") == 0) {					//fg, transfer jobs from SQ or WQ to continue
-		if (syscmmd[0][0][0] == 1)
-			jobid = 1;
-		else
-			jobid = xStr2Num(syscmmd[0][2]);
-
-		if (jobid <= Sheader->pcnt) {
-			Sptr = searchQ(Sheader,jobid);
-			if (Sptr == NULL) {
-				printf("There is no such job\n");
-				return NULL;
-			}
-
-			for (i = Sptr->stpid; i < Sptr->pcnt; ++i) {
-				while (i == Sptr->stpid) {
-					kill(Sptr->pidlist[Sptr->stpid], SIGCONT);
-					waitpid(Sptr->pidlist[Sptr->stpid], &status, WCONTINUED);
-					if(WIFCONTINUED(status))
-						break;
-				}				
-				waitpid(Sptr->pidlist[i], &status, WUNTRACED);
-				if(WIFSTOPPED(status) == true) {
-					is_stopped = 0;
-					Sptr->stpid = i;
-					printf("process[%d] has been stopped\n", Sptr->pidlist[i]);
-					break;
-				}
-				else
-					printf("process[%d] has completed\n", Sptr->pidlist[i]);
-			}
-
-			if (is_stopped != 0)
-				deleteQ(Sheader,jobid);
-		}
-		else {
-			Wptr = searchQ(Wheader,jobid - Sheader->pcnt);
-			if (Wptr == NULL) {
-				printf("There is no such job\n");
-				return NULL;
-			}
-
-			for (i = Wptr->stpid; i < Wptr->pcnt; ++i) {
-				waitpid(Wptr->pidlist[i], &status, WUNTRACED);
-				if(WIFSTOPPED(status) == true) {
-					Nptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
-					for (j = 0; j < Wptr->pcnt; ++j) 
-						Nptr->pidlist[j] = Wptr->pidlist[j];
-					Nptr->pcnt = Wptr->pcnt;
-					Nptr->stpid = i;
-					Nrear = insertQ(Sheader,Srear,Nptr);
-					*chnptr = 2;
-					printf("process[%d] has been stopped\n", Wptr->pidlist[i]);
-					break;
-				}
-				else
-					printf("process[%d] has completed\n", Wptr->pidlist[i]);
-			}
-
-			deleteQ(Wheader,jobid - Sheader->pcnt);
-		}
-
-	}
-	else if(strcmp(syscmmd[0][1], "bg") == 0) {					//bg, transfer jobs from SQ to WQ and continue
-		if (syscmmd[0][0][0] == 1)
-			jobid = 1;
-		else
-			jobid = xStr2Num(syscmmd[0][2]);
-
-		if (Sheader->pcnt < jobid) {
-			printf("There is no such job\n");
-			return NULL;
-		}
-
-		Sptr = searchQ(Sheader,jobid);
-		Nptr = (Ptr2Que)malloc(sizeof(struct WaitingQueue));
-		for (j = 0; j < Sptr->pcnt; ++j) 
-			Nptr->pidlist[j] = Sptr->pidlist[j];
-		Nptr->pcnt = Sptr->pcnt;
-		Nptr->stpid = Sptr->stpid;
-		Nrear = insertQ(Wheader,Wrear,Nptr);
-		*chnptr = 1;
-		deleteQ(Sheader,jobid);
-
-		while (1) {
-			kill(Nptr->pidlist[Nptr->stpid], SIGCONT);
-			waitpid(Nptr->pidlist[Nptr->stpid], &status, WCONTINUED);
-			if(WIFCONTINUED(status))
-				break;
-		}
-	}
-	else {
-		*chnptr = 0;
-		return NULL;												//cmmd is not internal 
-	}
-
-	return Nrear;
+void initial_syscmmd(char (*syscmmd)[SEPINS][ARGLEN]) {
+	int i, j;
+	//initial the command buffer
+	for (i = 0; i < TOTINS; ++i)
+		for (j = 0; j < SEPINS; ++j)
+			memset(syscmmd[i][j], 0, sizeof(syscmmd[i][j]));
 }
