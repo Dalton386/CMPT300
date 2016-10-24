@@ -98,7 +98,10 @@ int main (int argc, char const *argv[]) {
 		}
 		switch(intrnum) {
 			case 0: exit(0);continue;
-			case 1: chdir(syscmmd[0][2]);continue;
+			case 1: 
+				if(chdir(syscmmd[0][2]))
+					perror("chdir");
+				continue;
 			case 2: exe_jobs(Jheader);continue;
 			case 3: exe_fg(syscmmd[0],Jheader);continue;
 			case 4: exe_bg(syscmmd[0],Jheader);continue;
