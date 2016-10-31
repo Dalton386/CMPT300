@@ -82,29 +82,47 @@ void null_function(){}
 // 	pthread_mutex_unlock(&LOCK);
 // }
 
+// void *thread1() {
+// 	int i;
+// 	pthread_mutex_lock(&LOCK);
+// 	for (i = 0; i < T_REPEATTIME; ++i) {
+// 		pthread_cond_signal(&COND);
+// 		clock_gettime(CLOCK_MONOTONIC,&start_w);
+// 		pthread_cond_wait(&COND, &LOCK);
+// 	}
+// 	pthread_cond_signal(&COND);
+// 	pthread_mutex_unlock(&LOCK);
+// }
+
+// void *thread2() {
+// 	int i;
+// 	pthread_mutex_lock(&LOCK);
+// 	for (i = 0; i < T_REPEATTIME; ++i) {
+// 		pthread_cond_signal(&COND);
+// 		pthread_cond_wait(&COND, &LOCK);
+// 		clock_gettime(CLOCK_MONOTONIC,&stop_w);
+// 		result_raw += timespecDiff(&stop_w,&start_w);
+// 	}
+// 	pthread_cond_signal(&COND);
+// 	pthread_mutex_unlock(&LOCK);
+// }
+
 void *thread1() {
 	int i;
-	pthread_mutex_lock(&LOCK);
+
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&start_w);
 	for (i = 0; i < T_REPEATTIME; ++i) {
-		pthread_cond_signal(&COND);
-		clock_gettime(CLOCK_MONOTONIC,&start_w);
-		pthread_cond_wait(&COND, &LOCK);
+		pthread_yield();
 	}
-	pthread_cond_signal(&COND);
-	pthread_mutex_unlock(&LOCK);
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&stop_w);
 }
 
 void *thread2() {
 	int i;
-	pthread_mutex_lock(&LOCK);
+
 	for (i = 0; i < T_REPEATTIME; ++i) {
-		pthread_cond_signal(&COND);
-		pthread_cond_wait(&COND, &LOCK);
-		clock_gettime(CLOCK_MONOTONIC,&stop_w);
-		result_raw += timespecDiff(&stop_w,&start_w);
+		pthread_yield();
 	}
-	pthread_cond_signal(&COND);
-	pthread_mutex_unlock(&LOCK);
 }
 
 void measure_functioncall() {
@@ -221,7 +239,10 @@ void measure_proceswitch() {
 	clock_gettime(CLOCK_MONOTONIC, &stop);
 	result_overhead = timespecDiff(&stop, &start);
 
-	// printf("result_ps is %llu, result_overhead is %llu\n", result_ps, result_overhead);
+	double raw_ps, raw_overhead;
+	raw_ps = result_ps * 1.0 / P_REPEATTIME;
+	raw_overhead = result_overhead * 1.0 / P_REPEATTIME;
+	printf("result_ps is %f, result_overhead is %f\n", raw_ps, raw_overhead);
 	per_ps = ((double)result_ps - (double)result_overhead) / (P_REPEATTIME * 2);
 	printf("CLOCK_MONOTONIC Measured: per proc_sw is %fns\n", per_ps);
 }
@@ -322,6 +343,55 @@ void measure_proceswitch() {
 // 	pthread_cond_destroy(&COND);
 // }
 
+// void measure_threadswitch() {
+// 	struct timespec start;
+// 	struct timespec stop;
+// 	unsigned long long result_overhead; //64 bit integer
+// 	double per_ts;
+// 	pthread_t tid1, tid2;
+// 	int i;
+// 	cpu_set_t set_t, set_m;
+
+// 	// COUNTER = 0;
+// 	CPU_ZERO(&set_t);
+// 	CPU_ZERO(&set_m);
+// 	CPU_SET(CPUNUM, &set_t);
+// 	CPU_SET(CPUNUM+2, &set_m);
+// 	pthread_mutex_init(&LOCK, NULL);
+// 	pthread_cond_init(&COND, NULL);
+
+// 	pthread_mutex_lock(&LOCK);
+// 	pthread_create(&tid1, NULL, thread1, NULL);
+// 	pthread_create(&tid2, NULL, thread2, NULL);
+// 	pthread_setaffinity_np(tid1, sizeof(set_t), &set_t);
+// 	pthread_setaffinity_np(tid2, sizeof(set_t), &set_t);
+// 	pthread_setaffinity_np(pthread_self(), sizeof(set_m), &set_m);
+// 	pthread_mutex_unlock(&LOCK);
+
+// 	result_raw = 0;
+// 	result_overhead = 0;
+
+// 	pthread_join(tid1, NULL);
+// 	pthread_join(tid2, NULL);
+
+// 	for (i = 0; i < T_REPEATTIME; ++i) {
+// 		clock_gettime(CLOCK_MONOTONIC,&start);
+// 		pthread_mutex_lock(&LOCK);
+// 		pthread_cond_signal(&COND);
+// 		pthread_mutex_unlock(&LOCK);
+// 		clock_gettime(CLOCK_MONOTONIC,&stop);
+// 		result_overhead += timespecDiff(&stop, &start);
+// 	}
+
+
+// 	per_ts = (result_raw - result_overhead) * 1.0 / T_REPEATTIME;
+
+// 	printf("CLOCK_MONOTONIC Measured: per thrd_sw is %fns\n", per_ts);
+
+// 	pthread_mutex_destroy(&LOCK);
+// 	pthread_cond_destroy(&COND);
+// }
+
 void measure_threadswitch() {
 	struct timespec start;
 	struct timespec stop;
@@ -353,17 +423,17 @@ void measure_threadswitch() {
 	pthread_join(tid1, NULL);
 	pthread_join(tid2, NULL);
 
-	for (i = 0; i < T_REPEATTIME; ++i) {
-		clock_gettime(CLOCK_MONOTONIC,&start);
-		pthread_mutex_lock(&LOCK);
-		pthread_cond_signal(&COND);
-		pthread_mutex_unlock(&LOCK);
-		clock_gettime(CLOCK_MONOTONIC,&stop);
-		result_overhead += timespecDiff(&stop, &start);
-	}
+	clock_gettime(CLOCK_MONOTONIC,&start);
+	for (i = 0; i < T_REPEATTIME; ++i) 
+		;
+	for (i = 0; i < T_REPEATTIME; ++i) 
+		;
+	clock_gettime(CLOCK_MONOTONIC,&stop);
 
+	result_raw = timespecDiff(&stop_w, &start_w);
+	result_overhead = timespecDiff(&stop, &start);
 
-	per_ts = (result_raw - result_overhead) * 1.0 / T_REPEATTIME;
+	per_ts = (result_raw - result_overhead) * 1.0 / (T_REPEATTIME * 2);
 
 	printf("CLOCK_MONOTONIC Measured: per thrd_sw is %fns\n", per_ts);
 
